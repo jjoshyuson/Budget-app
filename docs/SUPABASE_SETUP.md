@@ -13,6 +13,7 @@ Put them in:
 
 - local `.env`
 - GitHub repository secrets named `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`
+- optional local `.env` value `VITE_SUPABASE_DELETE_ACCOUNT_FUNCTION=delete-account`
 
 Use `.env.example` as the template.
 
@@ -86,6 +87,50 @@ To publish:
 5. Push to `main`
 
 The workflow builds the app and deploys `dist` to GitHub Pages.
+
+## 4.5 Delete-account function
+
+If you want the in-app "Delete account and data" button to remove the auth user too, deploy a Supabase Edge Function named `delete-account`.
+
+Example:
+
+```ts
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+Deno.serve(async (req) => {
+  const authHeader = req.headers.get('Authorization') || ''
+  const token = authHeader.replace('Bearer ', '')
+
+  const supabase = createClient(
+    Deno.env.get('SUPABASE_URL')!,
+    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!,
+  )
+
+  const {
+    data: { user },
+    error: userError,
+  } = await supabase.auth.getUser(token)
+
+  if (userError || !user) {
+    return new Response('Unauthorized', { status: 401 })
+  }
+
+  const { error } = await supabase.auth.admin.deleteUser(user.id)
+  if (error) {
+    return new Response(error.message, { status: 400 })
+  }
+
+  return new Response(JSON.stringify({ ok: true }), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+})
+```
+
+Set the function name in the app with:
+
+```env
+VITE_SUPABASE_DELETE_ACCOUNT_FUNCTION=delete-account
+```
 
 ## 5. What the app does
 

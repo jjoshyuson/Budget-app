@@ -145,6 +145,18 @@ export async function saveSettings(settings: Settings) {
   await db.put('settings', settings, 'primary')
 }
 
+export async function resetLocalData() {
+  const db = await getDb()
+  const tx = db.transaction(['transactions', 'categories', 'bills', 'paychecks', 'settings'], 'readwrite')
+  await tx.objectStore('transactions').clear()
+  await tx.objectStore('categories').clear()
+  await tx.objectStore('bills').clear()
+  await tx.objectStore('paychecks').clear()
+  await Promise.all(defaultCategories.map((category) => tx.objectStore('categories').put(category)))
+  await tx.objectStore('settings').put(defaultSettings, 'primary')
+  await tx.done
+}
+
 export async function importBackup(data: BackupData) {
   const db = await getDb()
   const tx = db.transaction(['transactions', 'categories', 'bills', 'paychecks', 'settings'], 'readwrite')

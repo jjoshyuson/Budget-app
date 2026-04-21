@@ -1,6 +1,7 @@
 import './style.css'
 import heroImage from './assets/hero.png'
 import {
+  deleteAccountWithPassword,
   getCurrentCloudProfile,
   isCloudConfigured,
   listenToAuthChanges,
@@ -19,6 +20,7 @@ import {
   importBackup,
   initDb,
   loadAll,
+  resetLocalData,
   saveBill,
   saveCategories,
   savePaycheck,
@@ -92,6 +94,8 @@ const state = {
     email: '',
     password: '',
   },
+  resetDraftPassword: '',
+  resetBusy: false,
   billDraft: {
     name: '',
     amount: '',
@@ -226,6 +230,7 @@ function bindGlobalEvents() {
     const target = event.target as HTMLInputElement | HTMLTextAreaElement
     const field = target.dataset.field
     if (!field) return
+    let shouldRender = true
 
     switch (field) {
       case 'search':
@@ -259,12 +264,19 @@ function bindGlobalEvents() {
         break
       case 'auth-display-name':
         state.authDraft.displayName = target.value
+        shouldRender = false
         break
       case 'auth-email':
         state.authDraft.email = target.value
+        shouldRender = false
         break
       case 'auth-password':
         state.authDraft.password = target.value
+        shouldRender = false
+        break
+      case 'reset-password':
+        state.resetDraftPassword = target.value
+        shouldRender = false
         break
       case 'bill-name':
         state.billDraft.name = target.value
@@ -304,7 +316,9 @@ function bindGlobalEvents() {
         break
     }
 
-    render()
+    if (shouldRender) {
+      render()
+    }
   })
 
   root.addEventListener('change', (event) => {
@@ -451,6 +465,9 @@ async function handleAction(action: string, source: HTMLElement) {
     case 'update-profile':
       await saveProfile()
       break
+    case 'delete-account':
+      await deleteAccountAndData()
+      break
     case 'sync-cloud-now':
       await syncCloudNow()
       break
@@ -498,6 +515,11 @@ async function handleAction(action: string, source: HTMLElement) {
 }
 
 function render() {
+  if (cloudConfigured && state.authReady && !state.user) {
+    root.innerHTML = renderAuthGate()
+    return
+  }
+
   const focus = captureFocus()
   const cycle = getCurrentCycleSummary()
   const summary = getCurrentMonthSummary()
@@ -557,6 +579,58 @@ function renderCurrentView(cycle: CycleSummary, summary: MonthSummary, filteredT
     default:
       return ''
   }
+}
+
+function renderAuthGate() {
+  return `
+    <div class="auth-screen">
+      <section class="auth-card">
+        <div class="auth-hero">
+          <p class="eyebrow">Pocket Budget</p>
+          <h1>Sign in to your budget</h1>
+          <p class="muted-paragraph">Your data stays on the device for offline use and syncs to the cloud when you reconnect.</p>
+        </div>
+
+        ${
+          cloudConfigured
+            ? `
+              <div class="type-switch auth-switch">
+                <button class="${state.authMode === 'sign_in' ? 'is-active' : ''}" data-action="set-auth-mode" data-auth-mode="sign_in">Sign in</button>
+                <button class="${state.authMode === 'sign_up' ? 'is-active' : ''}" data-action="set-auth-mode" data-auth-mode="sign_up">Register</button>
+              </div>
+
+              <div class="form-stack auth-form">
+                ${
+                  state.authMode === 'sign_up'
+                    ? `
+                      <label class="field">
+                        <span>Display name</span>
+                        <input id="auth-display-name" data-field="auth-display-name" value="${escapeAttribute(state.authDraft.displayName)}" placeholder="Josh, Mom, Kuya" />
+                      </label>
+                    `
+                    : ''
+                }
+                <label class="field">
+                  <span>Email</span>
+                  <input id="auth-email" data-field="auth-email" type="email" value="${escapeAttribute(state.authDraft.email)}" placeholder="family@email.com" autocapitalize="off" />
+                </label>
+                <label class="field">
+                  <span>Password</span>
+                  <input id="auth-password" data-field="auth-password" type="password" value="${escapeAttribute(state.authDraft.password)}" placeholder="At least 6 characters" />
+                </label>
+                ${state.authError ? `<p class="form-error">${escapeHtml(state.authError)}</p>` : `<p class="tiny-note">No email verification required. Family members can sign in right away.</p>`}
+                <button class="primary-button auth-submit" data-action="submit-auth" ${state.authBusy ? 'disabled' : ''}>${state.authBusy ? 'Working...' : state.authMode === 'sign_in' ? 'Sign in' : 'Create account'}</button>
+              </div>
+            `
+            : `
+              <div class="form-stack auth-form">
+                <p class="muted-paragraph">Cloud keys are missing, so the app is still in local-only mode.</p>
+              </div>
+            `
+        }
+      </section>
+    </div>
+  `
 }
 
 function renderHome(cycle: CycleSummary) {
@@ -969,6 +1043,21 @@ function renderSettings() {
         ${renderCloudSettings()}
       </article>
 
+      <article class="section-card form-stack danger-zone">
+        <div class="section-header">
+          <div>
+            <p class="muted-label">Danger zone</p>
+            <h3>Delete everything</h3>
+          </div>
+        </div>
+        <p class="muted-paragraph">This removes local data, the cloud backup, and the signed-in account. It cannot be undone.</p>
+        <label class="field">
+          <span>Confirm with your password</span>
+          <input id="reset-password" data-field="reset-password" type="password" value="${escapeAttribute(state.resetDraftPassword)}" placeholder="Enter password to delete everything" />
+        </label>
+        <button class="ghost-button danger subtle-danger" data-action="delete-account" ${state.resetBusy ? 'disabled' : ''}>${state.resetBusy ? 'Deleting...' : 'Delete account and data'}</button>
+      </article>
+
       <article class="section-card form-stack">
         <div class="section-header">
           <div>
@@ -1037,7 +1126,7 @@ function renderCloudSettings() {
             ? `
               <label class="field">
                 <span>Display name</span>
-                <input data-field="auth-display-name" value="${escapeAttribute(state.authDraft.displayName)}" placeholder="Josh, Mom, Kuya" />
+                <input id="settings-auth-display-name" data-field="auth-display-name" value="${escapeAttribute(state.authDraft.displayName)}" placeholder="Josh, Mom, Kuya" />
               </label>
             `
             : ''
@@ -1045,11 +1134,11 @@ function renderCloudSettings() {
 
         <label class="field">
           <span>Email</span>
-          <input data-field="auth-email" type="email" value="${escapeAttribute(state.authDraft.email)}" placeholder="family@email.com" autocapitalize="off" />
+          <input id="settings-auth-email" data-field="auth-email" type="email" value="${escapeAttribute(state.authDraft.email)}" placeholder="family@email.com" autocapitalize="off" />
         </label>
         <label class="field">
           <span>Password</span>
-          <input data-field="auth-password" type="password" value="${escapeAttribute(state.authDraft.password)}" placeholder="At least 6 characters" />
+          <input id="settings-auth-password" data-field="auth-password" type="password" value="${escapeAttribute(state.authDraft.password)}" placeholder="At least 6 characters" />
         </label>
         ${state.authError ? `<p class="form-error">${escapeHtml(state.authError)}</p>` : `<p class="muted-paragraph">Once signed in, this device stays usable offline and syncs again when you reconnect.</p>`}
         <button class="primary-button" data-action="submit-auth" ${state.authBusy ? 'disabled' : ''}>${state.authBusy ? 'Working...' : state.authMode === 'sign_in' ? 'Sign in' : 'Create account'}</button>
@@ -1069,7 +1158,7 @@ function renderCloudSettings() {
       </div>
       <label class="field">
         <span>Profile name</span>
-        <input data-field="auth-display-name" value="${escapeAttribute(state.authDraft.displayName)}" placeholder="Family member name" />
+        <input id="settings-profile-name" data-field="auth-display-name" value="${escapeAttribute(state.authDraft.displayName)}" placeholder="Family member name" />
       </label>
       <p class="muted-paragraph">${escapeHtml(state.syncMessage)}</p>
       <div class="button-row">
@@ -2031,6 +2120,7 @@ async function signOutUser() {
     await signOutCloud()
     state.user = null
     state.authDraft.password = ''
+    state.resetDraftPassword = ''
     state.syncStatus = 'idle'
     state.syncMessage = 'Cloud sync not connected yet.'
     flashToast('Logged out.')
@@ -2060,6 +2150,42 @@ async function syncCloudNow() {
   }
   await pushSnapshotToCloud()
   render()
+}
+
+async function deleteAccountAndData() {
+  if (!state.user) {
+    flashToast('Sign in first to delete the account.')
+    return
+  }
+
+  if (!state.resetDraftPassword) {
+    flashToast('Enter your password first.')
+    return
+  }
+
+  if (!window.confirm('Delete this account and wipe every budget record? This cannot be undone.')) {
+    return
+  }
+
+  state.resetBusy = true
+  render()
+
+  try {
+    await deleteAccountWithPassword(state.resetDraftPassword)
+    await resetLocalData()
+    await refreshData()
+    state.resetDraftPassword = ''
+    state.authDraft = { displayName: '', email: '', password: '' }
+    state.user = null
+    state.syncStatus = 'idle'
+    state.syncMessage = 'Cloud sync not connected yet.'
+    flashToast('Account and data deleted.')
+  } catch (error) {
+    flashToast(error instanceof Error ? error.message : 'Could not delete the account.')
+  } finally {
+    state.resetBusy = false
+    render()
+  }
 }
 
 async function hydrateFromCloudIfNeeded() {

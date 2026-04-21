@@ -8,6 +8,7 @@ import type { BackupData, CloudProfile } from './types'
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim()
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim()
+const deleteAccountFunctionName = import.meta.env.VITE_SUPABASE_DELETE_ACCOUNT_FUNCTION?.trim()
 
 let client: SupabaseClient | null = null
 
@@ -127,6 +128,29 @@ export async function signOutCloud() {
   if (error) throw error
 }
 
+export async function clearCloudData() {
+  const supabase = getClient()
+  if (!supabase) {
+    throw new Error('Cloud sync is not configured yet.')
+  }
+
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+
+  if (!session?.user) {
+    throw new Error('Sign in first to clear cloud data.')
+  }
+
+  const [{ error: snapshotError }, { error: profileError }] = await Promise.all([
+    supabase.from('user_snapshots').delete().eq('user_id', session.user.id),
+    supabase.from('user_profiles').delete().eq('user_id', session.user.id),
+  ])
+
+  if (snapshotError) throw snapshotError
+  if (profileError) throw profileError
+}
+
 export async function updateCloudProfile(displayName: string) {
   const supabase = getClient()
   if (!supabase) {
@@ -208,4 +232,53 @@ export async function loadCloudSnapshot() {
 
   if (error) throw error
   return data?.payload ?? null
+}
+
+export async function deleteAccountWithPassword(password: string) {
+  const supabase = getClient()
+  if (!supabase) {
+    throw new Error('Cloud sync is not configured yet.')
+  }
+
+  if (!deleteAccountFunctionName) {
+    throw new Error('Account deletion still needs the delete-account function configured.')
+  }
+
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
+
+  if (!session?.user?.email) {
+    throw new Error('Sign in first to delete the account.')
+  }
+
+  const { error: authError } = await supabase.auth.signInWithPassword({
+    email: session.user.email,
+    password,
+  })
+
+  if (authError) throw authError
+
+  const {
+    data: { session: freshSession },
+  } = await supabase.auth.getSession()
+
+  const accessToken = freshSession?.access_token
+  if (!accessToken) {
+    throw new Error('Could not verify the account session.')
+  }
+
+  const response = await fetch(`${supabaseUrl}/functions/v1/${deleteAccountFunctionName}`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({}),
+  })
+
+  if (!response.ok) {
+    const message = await response.text()
+    throw new Error(message || 'Could not delete the account.')
+  }
 }

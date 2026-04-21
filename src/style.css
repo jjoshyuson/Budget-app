@@ -103,6 +103,44 @@ img {
   min-height: 100svh;
 }
 
+.auth-screen {
+  min-height: 100svh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 24px 20px;
+  border: 1px solid var(--line);
+  border-radius: 22px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(24px) saturate(120%);
+}
+
+.auth-hero h1 {
+  margin: 6px 0 10px;
+  font-size: 34px;
+  line-height: 1.02;
+  letter-spacing: -0.03em;
+}
+
+.auth-switch {
+  margin-top: 18px;
+}
+
+.auth-form {
+  margin-top: 16px;
+}
+
+.auth-submit {
+  width: 100%;
+}
+
 .app-shell {
   max-width: 520px;
   min-height: 100svh;
@@ -300,6 +338,10 @@ img {
 
 .subtle-danger {
   color: var(--danger);
+}
+
+.danger-zone {
+  border-color: rgba(214, 69, 69, 0.18);
 }
 
 .accent-theme-button {
