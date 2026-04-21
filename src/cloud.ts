@@ -43,12 +43,19 @@ export async function getCurrentCloudProfile() {
   const supabase = getClient()
   if (!supabase) return null
 
-  const [{ data: authData }, { data: profileData }] = await Promise.all([
-    supabase.auth.getSession(),
-    supabase.from('user_profiles').select('display_name').maybeSingle<{ display_name: string }>(),
-  ])
+  const {
+    data: { session },
+  } = await supabase.auth.getSession()
 
-  return mapProfile(authData.session, profileData?.display_name)
+  if (!session?.user) return null
+
+  const { data: profileData } = await supabase
+    .from('user_profiles')
+    .select('display_name')
+    .eq('user_id', session.user.id)
+    .maybeSingle<{ display_name: string }>()
+
+  return mapProfile(session, profileData?.display_name)
 }
 
 export function listenToAuthChanges(callback: (profile: CloudProfile | null, event: AuthChangeEvent) => void) {
@@ -62,7 +69,11 @@ export function listenToAuthChanges(callback: (profile: CloudProfile | null, eve
   } = supabase.auth.onAuthStateChange(async (event, session) => {
     let displayName: string | null = null
     if (session?.user) {
-      const { data } = await supabase.from('user_profiles').select('display_name').maybeSingle<{ display_name: string }>()
+      const { data } = await supabase
+        .from('user_profiles')
+        .select('display_name')
+        .eq('user_id', session.user.id)
+        .maybeSingle<{ display_name: string }>()
       displayName = data?.display_name ?? null
     }
     callback(mapProfile(session, displayName), event)
@@ -117,7 +128,11 @@ export async function signInWithEmail(email: string, password: string) {
   const { data, error } = await supabase.auth.signInWithPassword({ email, password })
   if (error) throw error
 
-  const { data: profileData } = await supabase.from('user_profiles').select('display_name').maybeSingle<{ display_name: string }>()
+  const { data: profileData } = await supabase
+    .from('user_profiles')
+    .select('display_name')
+    .eq('user_id', data.user.id)
+    .maybeSingle<{ display_name: string }>()
   return mapProfile(data.session, profileData?.display_name)
 }
 
@@ -231,7 +246,7 @@ export async function loadCloudSnapshot() {
     .maybeSingle<{ payload: BackupData; updated_at: string }>()
 
   if (error) throw error
-  return data?.payload ?? null
+  return data ? { payload: data.payload, updatedAt: data.updated_at } : null
 }
 
 export async function deleteAccountWithPassword(password: string) {
@@ -276,6 +291,10 @@ export async function deleteAccountWithPassword(password: string) {
     },
     body: JSON.stringify({}),
   })
+
+  if (response.status === 404) {
+    throw new Error(`Account deletion is unavailable because the "${deleteAccountFunctionName}" Edge Function is not deployed.`)
+  }
 
   if (!response.ok) {
     const message = await response.text()

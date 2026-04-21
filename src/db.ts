@@ -1,6 +1,12 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import { defaultCategories, defaultSettings } from './data'
-import type { BackupData, Category, Paycheck, RecurringBill, Settings, Transaction } from './types'
+import type { BackupData, Category, LocalAppMeta, Paycheck, RecurringBill, Settings, Transaction } from './types'
+
+const defaultLocalMeta: LocalAppMeta = {
+  activeUserId: null,
+  lastMutationAt: null,
+  lastHydratedAt: null,
+}
 
 interface BudgetingDB extends DBSchema {
   transactions: {
@@ -27,13 +33,17 @@ interface BudgetingDB extends DBSchema {
     key: string
     value: Settings
   }
+  meta: {
+    key: string
+    value: LocalAppMeta
+  }
 }
 
 let dbPromise: Promise<IDBPDatabase<BudgetingDB>> | null = null
 
 function getDb() {
   if (!dbPromise) {
-    dbPromise = openDB<BudgetingDB>('budgeting-app-db', 2, {
+    dbPromise = openDB<BudgetingDB>('budgeting-app-db', 3, {
       upgrade(db) {
         if (!db.objectStoreNames.contains('transactions')) {
           const transactions = db.createObjectStore('transactions', { keyPath: 'id' })
@@ -51,6 +61,9 @@ function getDb() {
         }
         if (!db.objectStoreNames.contains('paychecks')) {
           db.createObjectStore('paychecks', { keyPath: 'id' })
+        }
+        if (!db.objectStoreNames.contains('meta')) {
+          db.createObjectStore('meta')
         }
       },
     })
@@ -90,7 +103,7 @@ export async function loadAll() {
     bills: bills
       .filter((bill) => bill.active)
       .sort((a, b) => a.dueDay - b.dueDay || a.name.localeCompare(b.name)),
-    paychecks: paychecks.sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt)),
+    paychecks: paychecks.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.date.localeCompare(a.date)),
     settings: settings ?? defaultSettings,
   }
 }
@@ -145,20 +158,32 @@ export async function saveSettings(settings: Settings) {
   await db.put('settings', settings, 'primary')
 }
 
+export async function loadLocalMeta() {
+  const db = await getDb()
+  return (await db.get('meta', 'primary')) ?? defaultLocalMeta
+}
+
+export async function saveLocalMeta(meta: LocalAppMeta) {
+  const db = await getDb()
+  await db.put('meta', meta, 'primary')
+}
+
 export async function resetLocalData() {
   const db = await getDb()
-  const tx = db.transaction(['transactions', 'categories', 'bills', 'paychecks', 'settings'], 'readwrite')
+  const tx = db.transaction(['transactions', 'categories', 'bills', 'paychecks', 'settings', 'meta'], 'readwrite')
   await tx.objectStore('transactions').clear()
   await tx.objectStore('categories').clear()
   await tx.objectStore('bills').clear()
   await tx.objectStore('paychecks').clear()
   await Promise.all(defaultCategories.map((category) => tx.objectStore('categories').put(category)))
   await tx.objectStore('settings').put(defaultSettings, 'primary')
+  await tx.objectStore('meta').put(defaultLocalMeta, 'primary')
   await tx.done
 }
 
 export async function importBackup(data: BackupData) {
   const db = await getDb()
+  const netPayHistory = Array.isArray(data.netPayHistory) ? data.netPayHistory : Array.isArray(data.paychecks) ? data.paychecks : []
   const tx = db.transaction(['transactions', 'categories', 'bills', 'paychecks', 'settings'], 'readwrite')
   await tx.objectStore('transactions').clear()
   await tx.objectStore('categories').clear()
@@ -167,7 +192,7 @@ export async function importBackup(data: BackupData) {
   await Promise.all(data.transactions.map((item) => tx.objectStore('transactions').put(item)))
   await Promise.all(data.categories.map((item) => tx.objectStore('categories').put(item)))
   await Promise.all(data.bills.map((item) => tx.objectStore('bills').put(item)))
-  await Promise.all(data.paychecks.map((item) => tx.objectStore('paychecks').put(item)))
+  await Promise.all(netPayHistory.map((item) => tx.objectStore('paychecks').put(item)))
   await tx.objectStore('settings').put(data.settings, 'primary')
   await tx.done
 }

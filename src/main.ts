@@ -12,7 +12,7 @@ import {
   signUpWithEmail,
   updateCloudProfile,
 } from './cloud'
-import { defaultSettings } from './data'
+import { defaultCategories, defaultSettings } from './data'
 import {
   deleteBill,
   deletePaycheck,
@@ -20,9 +20,11 @@ import {
   importBackup,
   initDb,
   loadAll,
+  loadLocalMeta,
   resetLocalData,
   saveBill,
   saveCategories,
+  saveLocalMeta,
   savePaycheck,
   saveSettings,
   saveTransaction,
@@ -32,6 +34,7 @@ import type {
   Category,
   CloudProfile,
   CycleSummary,
+  LocalAppMeta,
   MonthSummary,
   Paycheck,
   RecurringBill,
@@ -56,6 +59,11 @@ const root: HTMLDivElement = rootElement
 const cloudConfigured = isCloudConfigured()
 let cloudSyncTimer: number | null = null
 let authUnsubscribe: (() => void) | null = null
+const defaultLocalMeta: LocalAppMeta = {
+  activeUserId: null,
+  lastMutationAt: null,
+  lastHydratedAt: null,
+}
 
 const state = {
   ready: false,
@@ -89,6 +97,8 @@ const state = {
   authError: '',
   syncStatus: cloudConfigured ? 'idle' as 'idle' | 'syncing' | 'synced' | 'offline' | 'error' : 'local',
   syncMessage: cloudConfigured ? 'Cloud sync not connected yet.' : 'Local-only mode',
+  cloudHydratedUserId: null as string | null,
+  localMeta: defaultLocalMeta as LocalAppMeta,
   authDraft: {
     displayName: '',
     email: '',
@@ -119,9 +129,16 @@ void bootstrap()
 
 async function bootstrap() {
   await initDb()
-  await refreshData()
-  await initializeCloud()
+  state.localMeta = await loadLocalMeta()
   bindGlobalEvents()
+  if (cloudConfigured) {
+    await initializeCloud()
+    if (!state.user) {
+      await clearSignedOutDeviceState(true)
+    }
+  } else {
+    await refreshData()
+  }
   applyTheme()
   render()
   registerServiceWorker()
@@ -138,7 +155,14 @@ async function refreshData() {
     totalOccurrences: bill.totalOccurrences ?? null,
   }))
   state.paychecks = paychecks
-  state.settings = { ...defaultSettings, ...settings }
+  state.settings = {
+    ...defaultSettings,
+    ...settings,
+    exportMetadata: {
+      ...defaultSettings.exportMetadata,
+      ...settings.exportMetadata,
+    },
+  }
   if (!state.settings.nextCutoffDate) {
     state.settings.nextCutoffDate = defaultNextCutoffDate()
   }
@@ -152,16 +176,15 @@ async function refreshData() {
 }
 
 async function initializeCloud() {
-  state.authReady = !cloudConfigured
-  if (!cloudConfigured) return
+  state.authReady = false
+  if (!cloudConfigured) {
+    state.authReady = true
+    return
+  }
 
   try {
-    state.user = await getCurrentCloudProfile()
-    state.authReady = true
-    if (state.user) {
-      state.authDraft.displayName = state.user.displayName
-      await hydrateFromCloudIfNeeded()
-    }
+    const profile = await getCurrentCloudProfile()
+    await handleAuthStateChange(profile, 'INITIAL_SESSION')
   } catch (error) {
     state.authReady = true
     state.syncStatus = 'error'
@@ -170,42 +193,185 @@ async function initializeCloud() {
 
   authUnsubscribe?.()
   authUnsubscribe = listenToAuthChanges((profile, event) => {
-    state.user = profile
-    state.authReady = true
-    state.authBusy = false
-    state.authError = ''
-    state.authDraft.password = ''
-    if (profile) {
-      state.authDraft.displayName = profile.displayName
-      state.authDraft.email = profile.email
-      state.syncStatus = navigator.onLine ? 'synced' : 'offline'
-      state.syncMessage = navigator.onLine ? 'Cloud account connected.' : 'Offline right now. Changes will sync later.'
-      void hydrateFromCloudIfNeeded()
-    } else {
-      state.syncStatus = 'idle'
-      state.syncMessage = 'Cloud sync not connected yet.'
-    }
-    if (event !== 'INITIAL_SESSION') {
-      render()
-    }
+    if (event === 'INITIAL_SESSION') return
+    void handleAuthStateChange(profile, event)
   })
 
   window.addEventListener('online', () => {
     if (!cloudConfigured) return
-    state.syncStatus = state.user ? 'syncing' : 'idle'
-    state.syncMessage = state.user ? 'Back online. Syncing your data...' : 'Back online.'
     if (state.user) {
-      queueCloudSync()
+      state.syncStatus = 'syncing'
+      state.syncMessage = 'Back online. Checking your latest cloud data...'
+      void hydrateAccountData(state.user)
+    } else {
+      state.syncStatus = 'idle'
+      state.syncMessage = 'Back online.'
     }
     render()
   })
 
   window.addEventListener('offline', () => {
     if (!cloudConfigured) return
+    cancelPendingCloudSync()
     state.syncStatus = state.user ? 'offline' : 'idle'
     state.syncMessage = state.user ? 'Offline. Local changes stay on this device until you reconnect.' : 'Offline.'
     render()
   })
+}
+
+async function handleAuthStateChange(profile: CloudProfile | null, event: string) {
+  cancelPendingCloudSync()
+  state.user = profile
+  state.authReady = true
+  state.authBusy = false
+  state.authError = ''
+  state.authDraft.password = ''
+
+  if (profile && state.cloudHydratedUserId === profile.id && state.localMeta.activeUserId === profile.id && event !== 'INITIAL_SESSION') {
+    state.authDraft.displayName = profile.displayName
+    state.authDraft.email = profile.email
+    render()
+    return
+  }
+
+  if (!profile) {
+    await clearSignedOutDeviceState(event !== 'INITIAL_SESSION')
+    state.syncStatus = 'idle'
+    state.syncMessage = 'Cloud sync not connected yet.'
+    render()
+    return
+  }
+
+  state.authDraft.displayName = profile.displayName
+  state.authDraft.email = profile.email
+  await hydrateAccountData(profile)
+  render()
+}
+
+async function hydrateAccountData(profile: CloudProfile) {
+  if (!cloudConfigured) return
+
+  state.syncStatus = navigator.onLine ? 'syncing' : 'offline'
+  state.syncMessage = navigator.onLine ? 'Checking cloud data...' : 'Offline. Showing the last local copy for this account if available.'
+  state.cloudHydratedUserId = null
+  await refreshData()
+
+  const sameLocalAccount = state.localMeta.activeUserId === profile.id
+  const unsignedLocalData = !state.localMeta.activeUserId && hasMeaningfulBudgetData()
+
+  if (!navigator.onLine) {
+    if (!sameLocalAccount) {
+      await resetLocalData()
+      state.localMeta = {
+        activeUserId: profile.id,
+        lastMutationAt: null,
+        lastHydratedAt: state.localMeta.lastHydratedAt,
+      }
+      await saveLocalMeta(state.localMeta)
+      await refreshData()
+      applyTheme()
+      state.syncMessage = 'This account needs one online load on this device before offline use.'
+    }
+    state.cloudHydratedUserId = profile.id
+    state.syncStatus = 'offline'
+    return
+  }
+
+  try {
+    const remoteSnapshot = await loadCloudSnapshot()
+    const normalizedRemote = remoteSnapshot ? normalizeBackupData(remoteSnapshot.payload, remoteSnapshot.updatedAt) : null
+    const localSnapshot = buildBackupPayload(false)
+    const localTimestamp = state.localMeta.lastMutationAt
+    const remoteTimestamp = normalizedRemote ? getSnapshotTimestamp(normalizedRemote, remoteSnapshot?.updatedAt) : null
+
+    if (normalizedRemote) {
+      if (!sameLocalAccount || !localTimestamp || !hasMeaningfulBudgetData() || (remoteTimestamp && remoteTimestamp >= localTimestamp)) {
+        await applyRemoteSnapshot(profile.id, normalizedRemote)
+        state.syncStatus = 'synced'
+        state.syncMessage = 'Latest cloud data loaded.'
+        return
+      }
+
+      state.cloudHydratedUserId = profile.id
+      await pushSnapshotToCloud()
+      return
+    }
+
+    if (sameLocalAccount && hasMeaningfulBudgetData()) {
+      state.cloudHydratedUserId = profile.id
+      await pushSnapshotToCloud()
+      return
+    }
+
+    if (unsignedLocalData) {
+      state.localMeta = {
+        activeUserId: profile.id,
+        lastMutationAt: localSnapshot.meta.lastModifiedAt,
+        lastHydratedAt: new Date().toISOString(),
+      }
+      await saveLocalMeta(state.localMeta)
+      state.cloudHydratedUserId = profile.id
+      await pushSnapshotToCloud()
+      return
+    }
+
+    await resetLocalData()
+    state.localMeta = {
+      activeUserId: profile.id,
+      lastMutationAt: null,
+      lastHydratedAt: new Date().toISOString(),
+    }
+    await saveLocalMeta(state.localMeta)
+    await refreshData()
+    applyTheme()
+    state.cloudHydratedUserId = profile.id
+    state.syncStatus = 'synced'
+    state.syncMessage = 'Cloud account ready.'
+  } catch (error) {
+    state.syncStatus = 'error'
+    state.syncMessage = error instanceof Error ? error.message : 'Cloud sync hit a problem.'
+  }
+}
+
+async function clearSignedOutDeviceState(clearDeviceData: boolean) {
+  cancelPendingCloudSync()
+  state.cloudHydratedUserId = null
+  state.user = null
+  state.quickAddOpen = false
+  state.quickAddExpanded = false
+  state.billModalOpen = false
+  state.paycheckModalOpen = false
+  state.resetDraftPassword = ''
+
+  if (clearDeviceData) {
+    await resetLocalData()
+  }
+
+  state.localMeta = clearDeviceData ? await loadLocalMeta() : state.localMeta
+  if (!state.localMeta.activeUserId && clearDeviceData) {
+    await refreshData()
+    applyTheme()
+  }
+}
+
+async function applyRemoteSnapshot(userId: string, snapshot: BackupData) {
+  await importBackup(snapshot)
+  state.localMeta = {
+    activeUserId: userId,
+    lastMutationAt: getSnapshotTimestamp(snapshot),
+    lastHydratedAt: new Date().toISOString(),
+  }
+  await saveLocalMeta(state.localMeta)
+  await refreshData()
+  applyTheme()
+  state.cloudHydratedUserId = userId
+}
+
+function cancelPendingCloudSync() {
+  if (cloudSyncTimer !== null) {
+    window.clearTimeout(cloudSyncTimer)
+    cloudSyncTimer = null
+  }
 }
 
 function bindGlobalEvents() {
@@ -335,9 +501,12 @@ function bindGlobalEvents() {
       state.settings.customAccent = target.value
       state.settings.accentTheme = 'custom'
       applyTheme()
-      void saveSettings(state.settings)
-      queueCloudSync()
-      render()
+      void (async () => {
+        await saveSettings(state.settings)
+        await recordLocalMutation()
+        queueCloudSync()
+        render()
+      })()
       return
     }
 
@@ -499,6 +668,7 @@ async function handleAction(action: string, source: HTMLElement) {
       state.settings.theme = (source.dataset.theme as Settings['theme']) || 'dark'
       applyTheme()
       await saveSettings(state.settings)
+      await recordLocalMutation()
       queueCloudSync()
       render()
       break
@@ -506,6 +676,7 @@ async function handleAction(action: string, source: HTMLElement) {
       state.settings.accentTheme = (source.dataset.accentTheme as Settings['accentTheme']) || 'ocean'
       applyTheme()
       await saveSettings(state.settings)
+      await recordLocalMutation()
       queueCloudSync()
       render()
       break
@@ -515,6 +686,11 @@ async function handleAction(action: string, source: HTMLElement) {
 }
 
 function render() {
+  if (cloudConfigured && !state.authReady) {
+    root.innerHTML = renderAuthLoading()
+    return
+  }
+
   if (cloudConfigured && state.authReady && !state.user) {
     root.innerHTML = renderAuthGate()
     return
@@ -562,6 +738,20 @@ function render() {
   `
 
   restoreFocus(focus)
+}
+
+function renderAuthLoading() {
+  return `
+    <div class="auth-screen">
+      <section class="auth-card">
+        <div class="auth-hero">
+          <p class="eyebrow">Pocket Budget</p>
+          <h1>Loading your account</h1>
+          <p class="muted-paragraph">Checking the signed-in session and the latest cloud budget data.</p>
+        </div>
+      </section>
+    </div>
+  `
 }
 
 function renderCurrentView(cycle: CycleSummary, summary: MonthSummary, filteredTransactions: Transaction[]) {
@@ -879,6 +1069,7 @@ function renderActivity(filteredTransactions: Transaction[]) {
 }
 
 function renderInsights(cycle: CycleSummary, monthSummary: MonthSummary) {
+  const currentPaycheck = getCyclePaycheck(cycle.start, cycle.end)
   const breakdown = state.categories
     .map((category) => ({
       category,
@@ -933,6 +1124,40 @@ function renderInsights(cycle: CycleSummary, monthSummary: MonthSummary) {
             <p class="muted-label">Target daily spend</p>
             <h3>${cycle.dailyAllowance !== null ? formatCurrency(cycle.dailyAllowance) : 'Input pay'}</h3>
           </article>
+        </div>
+      </article>
+
+      <article class="section-card">
+        <div class="section-header compact">
+          <div>
+            <p class="muted-label">Net pay history</p>
+            <h3>Latest entry controls the runway</h3>
+          </div>
+          <button class="ghost-button" data-action="open-paycheck-modal">Log entry</button>
+        </div>
+        <div class="plan-list">
+          ${state.paychecks.length
+            ? state.paychecks
+                .slice(0, 8)
+                .map(
+                  (paycheck) => `
+                    <article class="plan-row">
+                      <div class="plan-main">
+                        <span class="plan-icon paycheck">${renderIcon('paycheck')}</span>
+                        <div>
+                          <strong>${formatCurrency(paycheck.amount)}</strong>
+                          <p>${formatShortDate(paycheck.date)} | logged ${formatDateTime(paycheck.createdAt)}${paycheck.note ? ` | ${escapeHtml(paycheck.note)}` : ''}</p>
+                        </div>
+                      </div>
+                      <div class="pill-stack">
+                        ${currentPaycheck?.id === paycheck.id ? '<span class="status-pill ok">Current</span>' : ''}
+                        <button class="ghost-button danger" data-action="delete-paycheck" data-paycheck-id="${paycheck.id}">Delete</button>
+                      </div>
+                    </article>
+                  `,
+                )
+                .join('')
+            : '<p class="muted-paragraph">No net pay history yet.</p>'}
         </div>
       </article>
 
@@ -1391,6 +1616,7 @@ function renderPaycheckComposer() {
       </div>
 
       <div class="form-stack">
+        <p class="muted-paragraph">The newest net pay entry for this cutoff becomes the live amount. Older entries stay in history.</p>
         <label class="field">
           <span>Net pay received</span>
           <input id="paycheck-amount" data-field="paycheck-amount" inputmode="decimal" value="${escapeAttribute(state.paycheckDraft.amount)}" placeholder="18500" />
@@ -1646,8 +1872,12 @@ function cycleExpensesByCategory(start: string, end: string) {
 function getCyclePaycheck(cycleStart: string, cycleEnd: string) {
   return (
     state.paychecks
-      .filter((paycheck) => paycheck.date >= cycleStart && paycheck.date < cycleEnd)
-      .sort((a, b) => b.date.localeCompare(a.date) || b.createdAt.localeCompare(a.createdAt))[0] ?? null
+      .filter((paycheck) =>
+        paycheck.cycleStart && paycheck.cycleEnd
+          ? paycheck.cycleStart === cycleStart && paycheck.cycleEnd === cycleEnd
+          : paycheck.date >= cycleStart && paycheck.date < cycleEnd,
+      )
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.date.localeCompare(a.date))[0] ?? null
   )
 }
 
@@ -1801,6 +2031,7 @@ async function commitQuickAdd() {
 
   await saveTransaction(transaction)
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   closeQuickAdd()
   flashToast(editingId ? 'Transaction updated.' : 'Expense saved.')
@@ -1825,6 +2056,7 @@ async function removeTransaction(id: string) {
   if (!window.confirm('Delete this transaction?')) return
   await deleteTransaction(id)
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   flashToast('Transaction deleted.')
   render()
@@ -1839,6 +2071,7 @@ async function persistSettings() {
   await saveSettings(state.settings)
   applyTheme()
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   state.editingLastCutoff = false
   flashToast('Cycle updated.')
@@ -1856,6 +2089,7 @@ function updateCategoryDraft(categoryId: string, monthlyBudget: number) {
 async function persistCategories() {
   await saveCategories(state.categories)
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   flashToast('Category budgets saved.')
   render()
@@ -1961,6 +2195,7 @@ async function addBill() {
     state.billModalOpen = false
     state.expandedBillId = billsToCreate[0].id
     await refreshData()
+    await recordLocalMutation()
     queueCloudSync()
     flashToast(isSplitBill ? 'Split bill added.' : 'Bill added.')
     render()
@@ -1975,6 +2210,7 @@ async function removeBill(id: string) {
   if (!window.confirm('Delete this recurring bill?')) return
   await deleteBill(id)
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   flashToast('Recurring bill removed.')
   render()
@@ -1988,18 +2224,14 @@ async function logPaycheck() {
     return
   }
 
-  const payDate = new Date(state.paycheckDraft.date || todayIso())
   const cycle = getCycleWindow()
-  const existing = getCyclePaycheck(toLocalIso(payDate), cycle.end)
-  if (existing) {
-    await deletePaycheck(existing.id)
-  }
+  const existing = getCyclePaycheck(cycle.start, cycle.end)
 
   const paycheck: Paycheck = {
     id: createId(),
     amount,
     date: state.paycheckDraft.date || todayIso(),
-    cycleStart: toLocalIso(payDate),
+    cycleStart: cycle.start,
     cycleEnd: cycle.end,
     note: state.paycheckDraft.note.trim(),
     createdAt: new Date().toISOString(),
@@ -2009,8 +2241,9 @@ async function logPaycheck() {
   state.paycheckDraft = { amount: '', date: todayIso(), note: '' }
   state.paycheckModalOpen = false
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
-  flashToast('Paycheck logged.')
+  flashToast(existing ? 'Net pay updated. Previous entry kept in history.' : 'Net pay logged.')
   render()
 }
 
@@ -2018,6 +2251,7 @@ async function removePaycheck(id: string) {
   if (!window.confirm('Delete this paycheck entry?')) return
   await deletePaycheck(id)
   await refreshData()
+  await recordLocalMutation()
   queueCloudSync()
   flashToast('Paycheck removed.')
   render()
@@ -2044,14 +2278,16 @@ async function exportBackup() {
 async function importBackupFile(file: File) {
   try {
     const text = await file.text()
-    const data = JSON.parse(text) as BackupData
-    if (!Array.isArray(data.transactions) || !Array.isArray(data.categories) || !Array.isArray(data.bills) || !Array.isArray(data.paychecks)) {
+    const parsed = JSON.parse(text) as BackupData
+    const data = normalizeBackupData(parsed)
+    if (!Array.isArray(data.transactions) || !Array.isArray(data.categories) || !Array.isArray(data.bills) || !Array.isArray(data.netPayHistory)) {
       throw new Error('Invalid backup file')
     }
     if (!window.confirm('Restore this backup and replace the current local data?')) return
     await importBackup(data)
     await refreshData()
     applyTheme()
+    await recordLocalMutation()
     queueCloudSync()
     flashToast('Backup restored.')
     render()
@@ -2105,7 +2341,7 @@ async function submitAuth() {
     state.authDraft.displayName = profile?.displayName || displayName
     state.authDraft.email = profile?.email || email
     state.authDraft.password = ''
-    await hydrateFromCloudIfNeeded()
+    await handleAuthStateChange(profile, 'MANUAL_SIGN_IN')
     flashToast(state.authMode === 'sign_up' ? 'Account created.' : 'Signed in.')
   } catch (error) {
     state.authError = error instanceof Error ? error.message : 'Could not sign in right now.'
@@ -2118,16 +2354,13 @@ async function submitAuth() {
 async function signOutUser() {
   try {
     await signOutCloud()
-    state.user = null
     state.authDraft.password = ''
     state.resetDraftPassword = ''
-    state.syncStatus = 'idle'
-    state.syncMessage = 'Cloud sync not connected yet.'
     flashToast('Logged out.')
   } catch (error) {
     flashToast(error instanceof Error ? error.message : 'Could not log out.')
+    render()
   }
-  render()
 }
 
 async function saveProfile() {
@@ -2172,11 +2405,18 @@ async function deleteAccountAndData() {
 
   try {
     await deleteAccountWithPassword(state.resetDraftPassword)
+    try {
+      await signOutCloud()
+    } catch {
+      // The auth user may already be gone; local cleanup still needs to continue.
+    }
     await resetLocalData()
+    state.localMeta = await loadLocalMeta()
     await refreshData()
     state.resetDraftPassword = ''
     state.authDraft = { displayName: '', email: '', password: '' }
     state.user = null
+    state.cloudHydratedUserId = null
     state.syncStatus = 'idle'
     state.syncMessage = 'Cloud sync not connected yet.'
     flashToast('Account and data deleted.')
@@ -2188,52 +2428,8 @@ async function deleteAccountAndData() {
   }
 }
 
-async function hydrateFromCloudIfNeeded() {
-  if (!state.user || !cloudConfigured) return
-
-  try {
-    state.syncStatus = navigator.onLine ? 'syncing' : 'offline'
-    state.syncMessage = navigator.onLine ? 'Checking cloud data...' : 'Offline. Local data stays on this device for now.'
-    render()
-
-    if (!navigator.onLine) return
-
-    const remote = await loadCloudSnapshot()
-    const local = buildBackupPayload(false)
-    if (remote) {
-      const remoteTime = new Date(remote.exportedAt).getTime()
-      const localTime = new Date(local.exportedAt).getTime()
-      if (!hasMeaningfulLocalData() || remoteTime >= localTime) {
-        await importBackup(remote)
-        await refreshData()
-        applyTheme()
-      } else {
-        await saveCloudSnapshot(local)
-      }
-      state.settings.exportMetadata.lastCloudSyncAt = new Date().toISOString()
-      state.syncStatus = 'synced'
-      state.syncMessage = 'Cloud backup is connected.'
-      render()
-      return
-    }
-
-    if (hasMeaningfulLocalData()) {
-      await saveCloudSnapshot(local)
-      state.settings.exportMetadata.lastCloudSyncAt = new Date().toISOString()
-      state.syncStatus = 'synced'
-      state.syncMessage = 'Local data copied to the cloud.'
-    } else {
-      state.syncStatus = 'synced'
-      state.syncMessage = 'Cloud account is ready.'
-    }
-  } catch (error) {
-    state.syncStatus = 'error'
-    state.syncMessage = error instanceof Error ? error.message : 'Cloud sync hit a problem.'
-  }
-}
-
 function queueCloudSync() {
-  if (!state.user || !cloudConfigured) return
+  if (!state.user || !cloudConfigured || state.cloudHydratedUserId !== state.user.id) return
   if (!navigator.onLine) {
     state.syncStatus = 'offline'
     state.syncMessage = 'Offline. Changes are still safe on this device.'
@@ -2241,9 +2437,7 @@ function queueCloudSync() {
     return
   }
 
-  if (cloudSyncTimer !== null) {
-    window.clearTimeout(cloudSyncTimer)
-  }
+  cancelPendingCloudSync()
 
   state.syncStatus = 'syncing'
   state.syncMessage = 'Saving to the cloud...'
@@ -2254,18 +2448,27 @@ function queueCloudSync() {
 }
 
 async function pushSnapshotToCloud() {
-  if (!state.user || !cloudConfigured) return
+  if (!state.user || !cloudConfigured || state.cloudHydratedUserId !== state.user.id) return
   if (!navigator.onLine) {
     state.syncStatus = 'offline'
     state.syncMessage = 'Offline. Changes will sync later.'
+    render()
     return
   }
 
   try {
     const payload = buildBackupPayload()
     await saveCloudSnapshot(payload)
+    state.settings.exportMetadata.lastCloudSyncAt = payload.meta.lastCloudSyncAt
+    state.localMeta = {
+      ...state.localMeta,
+      activeUserId: state.user.id,
+      lastHydratedAt: payload.meta.lastCloudSyncAt,
+    }
+    await saveLocalMeta(state.localMeta)
+    await saveSettings(state.settings)
     state.syncStatus = 'synced'
-    state.syncMessage = `Synced ${new Date(payload.exportedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.`
+    state.syncMessage = `Synced ${new Date(payload.meta.lastCloudSyncAt || payload.exportedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}.`
   } catch (error) {
     state.syncStatus = 'error'
     state.syncMessage = error instanceof Error ? error.message : 'Cloud sync failed.'
@@ -2275,9 +2478,15 @@ async function pushSnapshotToCloud() {
 
 function buildBackupPayload(updateCloudTimestamp = true): BackupData {
   const now = new Date().toISOString()
+  const lastModifiedAt = state.localMeta.lastMutationAt || now
   return {
-    version: 1,
+    version: 2,
     exportedAt: now,
+    meta: {
+      schemaVersion: 2,
+      lastModifiedAt,
+      lastCloudSyncAt: updateCloudTimestamp ? now : state.settings.exportMetadata.lastCloudSyncAt,
+    },
     settings: {
       ...state.settings,
       exportMetadata: {
@@ -2288,12 +2497,88 @@ function buildBackupPayload(updateCloudTimestamp = true): BackupData {
     categories: state.categories,
     transactions: state.transactions,
     bills: state.bills,
-    paychecks: state.paychecks,
+    netPayHistory: state.paychecks,
   }
 }
 
-function hasMeaningfulLocalData() {
-  return state.transactions.length > 0 || state.bills.length > 0 || state.paychecks.length > 0
+async function recordLocalMutation(at = new Date().toISOString()) {
+  state.localMeta = {
+    ...state.localMeta,
+    activeUserId: state.user?.id ?? state.localMeta.activeUserId,
+    lastMutationAt: at,
+  }
+  await saveLocalMeta(state.localMeta)
+}
+
+function normalizeBackupData(data: BackupData, fallbackUpdatedAt?: string): BackupData {
+  const netPayHistory = Array.isArray(data.netPayHistory) ? data.netPayHistory : Array.isArray(data.paychecks) ? data.paychecks : []
+  const settings = {
+    ...defaultSettings,
+    ...data.settings,
+    exportMetadata: {
+      ...defaultSettings.exportMetadata,
+      ...data.settings?.exportMetadata,
+    },
+  }
+  const lastModifiedAt = data.meta?.lastModifiedAt || fallbackUpdatedAt || data.exportedAt || new Date().toISOString()
+
+  return {
+    version: data.version || 2,
+    exportedAt: data.exportedAt || lastModifiedAt,
+    meta: {
+      schemaVersion: data.meta?.schemaVersion || 2,
+      lastModifiedAt,
+      lastCloudSyncAt: data.meta?.lastCloudSyncAt || settings.exportMetadata.lastCloudSyncAt || fallbackUpdatedAt || null,
+    },
+    settings,
+    categories: Array.isArray(data.categories) ? data.categories : defaultCategories,
+    transactions: Array.isArray(data.transactions) ? data.transactions : [],
+    bills: Array.isArray(data.bills) ? data.bills : [],
+    netPayHistory,
+  }
+}
+
+function getSnapshotTimestamp(snapshot: BackupData, fallbackUpdatedAt?: string) {
+  return snapshot.meta?.lastModifiedAt || fallbackUpdatedAt || snapshot.exportedAt || new Date(0).toISOString()
+}
+
+function hasMeaningfulBudgetData(snapshot = buildBackupPayload(false)) {
+  return (
+    snapshot.transactions.length > 0 ||
+    snapshot.bills.length > 0 ||
+    snapshot.netPayHistory.length > 0 ||
+    settingsDifferFromDefault(snapshot.settings) ||
+    categoriesDifferFromDefault(snapshot.categories)
+  )
+}
+
+function settingsDifferFromDefault(settings: Settings) {
+  return (
+    settings.currency !== defaultSettings.currency ||
+    settings.locale !== defaultSettings.locale ||
+    settings.theme !== defaultSettings.theme ||
+    settings.accentTheme !== defaultSettings.accentTheme ||
+    settings.customAccent !== defaultSettings.customAccent ||
+    settings.lastCutoffDate !== defaultSettings.lastCutoffDate ||
+    settings.nextCutoffDate !== defaultSettings.nextCutoffDate
+  )
+}
+
+function categoriesDifferFromDefault(categories: Category[]) {
+  if (categories.length !== defaultCategories.length) return true
+  return categories.some((category, index) => {
+    const defaults = defaultCategories[index]
+    return (
+      !defaults ||
+      category.id !== defaults.id ||
+      category.name !== defaults.name ||
+      category.icon !== defaults.icon ||
+      category.color !== defaults.color ||
+      category.monthlyBudget !== defaults.monthlyBudget ||
+      category.sortOrder !== defaults.sortOrder ||
+      category.archived !== defaults.archived
+    )
+  })
 }
 
 function flashToast(message: string) {
@@ -2367,6 +2652,15 @@ function formatLongDate(iso: string) {
     month: 'short',
     day: 'numeric',
     year: 'numeric',
+  })
+}
+
+function formatDateTime(value: string) {
+  return new Date(value).toLocaleString(state.settings.locale || undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
   })
 }
 

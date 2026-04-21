@@ -43,6 +43,18 @@ export interface CloudProfile {
   displayName: string
 }
 
+export interface SnapshotMeta {
+  schemaVersion: number
+  lastModifiedAt: string
+  lastCloudSyncAt: string | null
+}
+
+export interface LocalAppMeta {
+  activeUserId: string | null
+  lastMutationAt: string | null
+  lastHydratedAt: string | null
+}
+
 export interface RecurringBill {
   id: string
   name: string
@@ -66,13 +78,15 @@ export interface Paycheck {
 }
 
 export interface BackupData {
-  version: 1
+  version: number
   exportedAt: string
+  meta: SnapshotMeta
   settings: Settings
   categories: Category[]
   transactions: Transaction[]
   bills: RecurringBill[]
-  paychecks: Paycheck[]
+  netPayHistory: Paycheck[]
+  paychecks?: Paycheck[]
 }
 
 export interface MonthSummary {
